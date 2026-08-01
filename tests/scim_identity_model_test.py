@@ -11,6 +11,8 @@ import re
 import threading
 import unicodedata
 from contextlib import contextmanager
+from datetime import date, datetime
+from types import SimpleNamespace
 
 import pytest
 import sqlalchemy as sa
@@ -93,6 +95,51 @@ def _captured_sql():
         yield statements
     finally:
         sa.event.remove(models.db.engine, 'before_cursor_execute', capture)
+
+
+def _seed_cycle_probe_graph(edge_rows, extra_ids=()):
+    resource_ids = sorted({
+        resource_id
+        for edge in edge_rows
+        for resource_id in edge
+    }.union(extra_ids))
+    models.db.session.execute(
+        models.ScimResource.__table__.insert(),
+        [
+            {
+                'id': resource_id,
+                'resource_type': 'Group',
+                'external_id_bytes': None,
+                'user_email': None,
+                'alias_email': None,
+                'subject_address': (
+                    f'fixture-{index:05d}@cycle.invalid'
+                ),
+                'deleted_at': datetime(2000, 1, 1),
+                'created_at': date(2000, 1, 1),
+                'updated_at': None,
+                'comment': 'cycle fixture',
+            }
+            for index, resource_id in enumerate(resource_ids)
+        ],
+    )
+    if edge_rows:
+        models.db.session.execute(
+            models.ScimGroupMember.__table__.insert(),
+            [
+                {'group_id': group_id, 'member_id': member_id}
+                for group_id, member_id in edge_rows
+            ],
+        )
+    models.db.session.commit()
+
+
+def _cycle_statements(statements):
+    return [
+        (statement, bound_strings)
+        for statement, bound_strings in statements
+        if ' from scim_group_member' in statement
+    ]
 
 
 def _group_graph_snapshot(group_id):
@@ -1018,25 +1065,231 @@ def test_mysql_local_claim_sees_external_delete_after_prior_read(app):
     ).count() == 0
 
 
-def test_group_cycle_is_rejected_before_materialization(app):
+def test_cycle_frontier_preserves_cycle_semantics_and_exact_ids(app):
+    edges = [
+        ('two:parent', 'two:target'),
+        ('diamond:left', 'diamond:target'),
+        ('diamond:right', 'diamond:target'),
+        ('diamond:top', 'diamond:left'),
+        ('diamond:top', 'diamond:right'),
+        ('Exact:Parent', 'exact:target'),
+        ('Exact:Positive', 'Exact:Target'),
+        ('replace:target', 'replace:old'),
+        ('disconnected:a', 'disconnected:b'),
+        ('disconnected:b', 'disconnected:a'),
+    ]
+    _seed_cycle_probe_graph(
+        edges,
+        extra_ids={
+            'diamond:safe',
+            'disconnected:target',
+            'empty:target',
+            'self:target',
+        },
+    )
+    cycle_error = re.escape('SCIM Group membership would create a cycle')
+
+    with _captured_sql() as statements:
+        with pytest.raises(models.ScimGraphError, match=cycle_error):
+            models._validate_scim_cycle(
+                SimpleNamespace(id='self:target'),
+                ['self:target'],
+            )
+        models._validate_scim_cycle(
+            SimpleNamespace(id='empty:target'),
+            [],
+        )
+    assert _cycle_statements(statements) == []
+
+    with pytest.raises(models.ScimGraphError, match=cycle_error):
+        models._validate_scim_cycle(
+            SimpleNamespace(id='two:target'),
+            ['two:parent'],
+        )
+    with pytest.raises(models.ScimGraphError, match=cycle_error):
+        models._validate_scim_cycle(
+            SimpleNamespace(id='diamond:target'),
+            ['diamond:top'],
+        )
+    with pytest.raises(models.ScimGraphError, match=cycle_error):
+        models._validate_scim_cycle(
+            SimpleNamespace(id='diamond:target'),
+            ['diamond:safe', 'diamond:top'],
+        )
+
+    models._validate_scim_cycle(
+        SimpleNamespace(id='Exact:Target'),
+        ['Exact:Parent'],
+    )
+    with pytest.raises(models.ScimGraphError, match=cycle_error):
+        models._validate_scim_cycle(
+            SimpleNamespace(id='Exact:Target'),
+            ['Exact:Positive'],
+        )
+    models._validate_scim_cycle(
+        SimpleNamespace(id='replace:target'),
+        ['replace:old'],
+    )
+    models._validate_scim_cycle(
+        SimpleNamespace(id='disconnected:target'),
+        ['disconnected:a'],
+    )
+
+
+def test_cycle_frontier_shallow_sql_ignores_unrelated_edges(app):
+    unrelated_ids = [
+        f'unrelated:{index:04d}'
+        for index in range(1025)
+    ]
+    edges = [
+        ('parent:0', 'shallow:target'),
+        ('parent:1', 'parent:0'),
+        *[
+            (unrelated_ids[index + 1], unrelated_ids[index])
+            for index in range(1024)
+        ],
+    ]
+    _seed_cycle_probe_graph(edges, extra_ids={'shallow:outside'})
+
+    with _captured_sql() as statements:
+        models._validate_scim_cycle(
+            SimpleNamespace(id='shallow:target'),
+            ['shallow:outside'],
+        )
+
+    cycle_statements = _cycle_statements(statements)
+    assert len(cycle_statements) == 3
+    assert all(
+        ' where scim_group_member.member_id in ' in statement
+        and 'scim_group_member.group_id !=' in statement
+        for statement, _bound_strings in cycle_statements
+    )
+    assert all(
+        set(bound_strings).isdisjoint(unrelated_ids)
+        for _statement, bound_strings in cycle_statements
+    )
+
+
+def test_cycle_frontier_chunks_wide_fan_in_at_500_values(app):
+    parent_ids = [
+        f'wide:parent:{index:04d}'
+        for index in range(1201)
+    ]
+    _seed_cycle_probe_graph(
+        [(parent_id, 'wide:target') for parent_id in parent_ids],
+        extra_ids={'wide:outside'},
+    )
+
+    with _captured_sql() as statements:
+        models._validate_scim_cycle(
+            SimpleNamespace(id='wide:target'),
+            ['wide:outside'],
+        )
+
+    cycle_statements = _cycle_statements(statements)
+    assert len(cycle_statements) == 4
+    assert all(
+        ' where scim_group_member.member_id in ' in statement
+        and 'scim_group_member.group_id !=' in statement
+        for statement, _bound_strings in cycle_statements
+    )
+    parent_id_set = set(parent_ids)
+    chunk_sizes = [
+        len(parent_id_set.intersection(bound_strings))
+        for _statement, bound_strings in cycle_statements[1:]
+    ]
+    assert chunk_sizes == [500, 500, 201]
+    assert all(
+        size <= models._SCIM_GRAPH_PROBE_CHUNK_SIZE
+        for size in chunk_sizes
+    )
+
+
+def test_cycle_frontier_fallback_is_iterative_correct_and_capped(app):
+    parent_ids = [
+        f'deep:parent:{index:04d}'
+        for index in range(1105)
+    ]
+    edges = [
+        (parent_ids[0], 'deep:target'),
+        ('deep:target', 'deep:old'),
+    ]
+    edges.extend(
+        (parent_ids[index], parent_ids[index - 1])
+        for index in range(1, len(parent_ids))
+    )
+    _seed_cycle_probe_graph(edges, extra_ids={'deep:outside'})
+    cycle_error = re.escape('SCIM Group membership would create a cycle')
+
+    with _captured_sql() as cyclic_statements:
+        with pytest.raises(models.ScimGraphError, match=cycle_error):
+            models._validate_scim_cycle(
+                SimpleNamespace(id='deep:target'),
+                [parent_ids[-1]],
+            )
+    models.db.session.rollback()
+
+    with _captured_sql() as acyclic_statements:
+        models._validate_scim_cycle(
+            SimpleNamespace(id='deep:target'),
+            ['deep:outside'],
+        )
+
+    for statements in (cyclic_statements, acyclic_statements):
+        cycle_statements = _cycle_statements(statements)
+        probes = [
+            entry
+            for entry in cycle_statements
+            if ' where scim_group_member.member_id in ' in entry[0]
+            and 'scim_group_member.group_id !=' in entry[0]
+        ]
+        fallback = [
+            entry
+            for entry in cycle_statements
+            if ' where ' not in entry[0]
+        ]
+        assert len(probes) == 64
+        assert len(fallback) == 1
+        assert len(cycle_statements) == 65
+        assert cycle_statements[-1] == fallback[0]
+
+
+def test_cycle_frontier_rejection_preserves_old_graph_and_projection(app):
+    original_member = _user('cycle-original')
     first = _managed_group('cycle-a')
     second = _managed_group('cycle-b')
-    original_projection = list(first.alias.destination)
+    first.external_id = 'original-external-id'
+    models.permit_scim_managed_alias_edit(first.alias)
+    first.alias.comment = 'Original comment'
+    models.replace_scim_group_graph(
+        first,
+        member_ids=[original_member.scim_resource.id],
+        external_destinations=['original@outside.test'],
+    )
     models.replace_scim_group_graph(
         second,
         member_ids=[first.id],
         external_destinations=[],
     )
     models.db.session.commit()
+    first_id = first.id
+    before = _group_graph_snapshot(first_id)
 
-    with pytest.raises(models.ScimGraphError):
+    first = models.db.session.get(models.ScimResource, first_id)
+    first.external_id = 'replacement-external-id'
+    models.permit_scim_managed_alias_edit(first.alias)
+    first.alias.comment = 'Replacement comment'
+    with pytest.raises(
+        models.ScimGraphError,
+        match=re.escape('SCIM Group membership would create a cycle'),
+    ):
         models.replace_scim_group_graph(
             first,
             member_ids=[second.id],
-            external_destinations=[],
+            external_destinations=['replacement@outside.test'],
         )
     models.db.session.rollback()
-    assert first.alias.destination == original_projection
+    assert _group_graph_snapshot(first_id) == before
 
 
 def test_hard_deleted_member_is_tombstoned_and_removed_from_group(app):
