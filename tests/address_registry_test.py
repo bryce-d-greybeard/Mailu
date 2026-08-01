@@ -493,6 +493,80 @@ def test_migration_refuses_cross_table_collision_before_ddl():
     engine.dispose()
 
 
+def test_migration_caps_case_collision_diagnostic_and_retries():
+    engine = _legacy_engine()
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO domain (name) VALUES ('example.com')"
+        )
+        connection.execute(
+            sa.text(
+                'INSERT INTO user (email, localpart, domain_name) '
+                'VALUES (:email, :localpart, :domain)'
+            ),
+            [
+                {
+                    'email': f'User{index:02d}@example.com',
+                    'localpart': f'User{index:02d}',
+                    'domain': 'example.com',
+                }
+                for index in range(22)
+            ],
+        )
+        connection.execute(
+            sa.text(
+                'INSERT INTO alias '
+                '(email, localpart, domain_name, owner_email) '
+                'VALUES (:email, :localpart, :domain, NULL)'
+            ),
+            [
+                {
+                    'email': f'user{index:02d}@example.com',
+                    'localpart': f'user{index:02d}',
+                    'domain': 'example.com',
+                }
+                for index in range(22)
+            ],
+        )
+
+    with pytest.raises(RuntimeError) as collision_error:
+        _run_migration(engine, 'upgrade')
+
+    diagnostic = str(collision_error.value)
+    assert diagnostic.splitlines() == [
+        'Cannot enforce global mail-address uniqueness. These addresses '
+        'exist as both User and Alias:',
+        *[
+            f'  user{index:02d}@example.com: '
+            f'User=User{index:02d}@example.com, '
+            f'Alias=user{index:02d}@example.com'
+            for index in range(20)
+        ],
+        '  ... additional collisions omitted',
+        'Remove or rename one owner of each address, then retry.',
+    ]
+    inspector = sa.inspect(engine)
+    assert 'mail_address' not in inspector.get_table_names()
+    assert 'address_type' not in {
+        column['name'] for column in inspector.get_columns('user')
+    }
+
+    with engine.begin() as connection:
+        connection.execute(sa.text(
+            "UPDATE alias SET email = 'alias' || substr(email, 5)"
+        ))
+
+    _run_migration(engine, 'upgrade')
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql(
+            'SELECT COUNT(*) FROM mail_address'
+        ).scalar_one() == 44
+        assert connection.exec_driver_sql(
+            'PRAGMA foreign_key_check'
+        ).all() == []
+    engine.dispose()
+
+
 def test_migration_backfills_constraints_and_downgrades_without_data_loss():
     engine = _legacy_engine()
     _seed_legacy(engine)

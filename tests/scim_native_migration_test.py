@@ -884,6 +884,60 @@ def test_mysql_registry_storage_preflight_is_before_ddl(
     _assert_table_snapshots(engine, snapshots)
 
 
+def test_address_collision_preflight_retries_without_native_ddl(
+    native_migration_app,
+):
+    engine = models.db.engine
+    _upgrade(BASE_REVISION)
+    snapshots = _seed_populated_legacy_database(engine)
+    changed_default = _change_mysql_database_default(engine)
+    with engine.begin() as connection:
+        table = _tables(connection, 'alias')
+        connection.execute(
+            table['alias'].update()
+            .where(table['alias'].c.email == 'list@example.com')
+            .values(email='admin@example.com')
+        )
+        collision_snapshot = _snapshot_tables(
+            connection,
+            _tables(connection, *snapshots),
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match='admin@example.com: User=admin@example.com, '
+        'Alias=admin@example.com',
+    ):
+        _upgrade(ADDRESS_REVISION)
+
+    inspector = sa.inspect(engine)
+    table_names = set(inspector.get_table_names())
+    assert 'mail_address' not in table_names
+    assert not {name for name in table_names if name.startswith('scim_')}
+    assert 'address_type' not in {
+        column['name'] for column in inspector.get_columns('user')
+    }
+    assert 'address_type' not in {
+        column['name'] for column in inspector.get_columns('alias')
+    }
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text(
+            'SELECT version_num FROM alembic_version'
+        )) == BASE_REVISION
+    _assert_table_snapshots(engine, collision_snapshot)
+
+    with engine.begin() as connection:
+        table = _tables(connection, 'alias')
+        connection.execute(
+            table['alias'].update()
+            .where(table['alias'].c.email == 'admin@example.com')
+            .values(email='list@example.com')
+        )
+
+    _upgrade('head')
+    _assert_populated_upgrade(engine, changed_default, snapshots)
+
+
 def test_invalid_legacy_identity_fails_before_identity_ddl_and_retries(
     native_migration_app,
 ):
@@ -1061,20 +1115,11 @@ def test_user_migration_reads_and_writes_are_bounded(
         get_final_froms = getattr(statement, 'get_final_froms', None)
         limit_clause = getattr(statement, '_limit_clause', None)
         if get_final_froms is not None and limit_clause is not None:
-            def table_names(from_clause):
-                name = getattr(from_clause, 'name', None)
-                if name is not None:
-                    return {name}
-                names = set()
-                for side in ('left', 'right'):
-                    nested = getattr(from_clause, side, None)
-                    if nested is not None:
-                        names.update(table_names(nested))
-                return names
-
-            from_names = set()
-            for from_clause in get_final_froms():
-                from_names.update(table_names(from_clause))
+            from_names = {
+                element.name
+                for element in sa.sql.visitors.iterate(statement)
+                if isinstance(element, sa.Table)
+            }
             if from_names == {'alias', 'user'}:
                 collision_probe_limits.append(limit_clause.value)
             if from_names == {'user'}:

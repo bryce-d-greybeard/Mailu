@@ -104,16 +104,45 @@ def _cross_table_collisions(connection):
     """Return a fixed-size diagnostic sample of cross-table collisions."""
     collisions = {}
     truncated = False
-    conditions = (
-        sa.func.lower(user.c.email) == sa.func.lower(alias.c.email),
-        user.c.email == alias.c.email,
+
+    missing_email = sa.type_coerce(
+        sa.null(),
+        sa.String(length=255),
     )
-    for condition in conditions:
+    lowered_addresses = sa.union_all(
+        sa.select(
+            sa.func.lower(user.c.email).label('canonical'),
+            user.c.email.label('user_email'),
+            missing_email.label('alias_email'),
+        ),
+        sa.select(
+            sa.func.lower(alias.c.email).label('canonical'),
+            missing_email.label('user_email'),
+            alias.c.email.label('alias_email'),
+        ),
+    ).subquery('lowered_address')
+    lowered_user_email = sa.func.min(lowered_addresses.c.user_email)
+    lowered_alias_email = sa.func.min(lowered_addresses.c.alias_email)
+
+    probes = (
+        sa.select(
+            lowered_user_email.label('user_email'),
+            lowered_alias_email.label('alias_email'),
+        )
+        .select_from(lowered_addresses)
+        .group_by(lowered_addresses.c.canonical)
+        .having(
+            lowered_user_email.is_not(None),
+            lowered_alias_email.is_not(None),
+        )
+        .order_by(lowered_user_email, lowered_alias_email),
+        sa.select(user.c.email, alias.c.email)
+        .select_from(user.join(alias, user.c.email == alias.c.email))
+        .order_by(user.c.email, alias.c.email),
+    )
+    for probe in probes:
         rows = connection.execute(
-            sa.select(user.c.email, alias.c.email)
-            .select_from(user.join(alias, condition))
-            .order_by(user.c.email, alias.c.email)
-            .limit(COLLISION_PROBE_LIMIT)
+            probe.limit(COLLISION_PROBE_LIMIT)
         ).all()
         if len(rows) > COLLISION_REPORT_LIMIT:
             truncated = True

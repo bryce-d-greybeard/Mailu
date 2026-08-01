@@ -938,6 +938,56 @@ def test_address_preflight_uses_native_database_collation():
     engine.dispose()
 
 
+def test_address_preflight_lowercase_probe_work_is_population_bounded():
+    population_size = 32
+    lower_calls = 0
+    engine = sa.create_engine('sqlite://')
+
+    @sa.event.listens_for(engine, 'connect')
+    def count_lower_calls(connection, _record):
+        def counted_lower(value):
+            nonlocal lower_calls
+            lower_calls += 1
+            return value.lower()
+
+        connection.create_function('lower', 1, counted_lower)
+
+    metadata = sa.MetaData()
+    user_table = sa.Table(
+        'user',
+        metadata,
+        sa.Column('email', sa.String(255), primary_key=True),
+    )
+    alias_table = sa.Table(
+        'alias',
+        metadata,
+        sa.Column('email', sa.String(255), primary_key=True),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(user_table.insert(), [
+            {'email': f'user-{index:03d}@example.com'}
+            for index in range(population_size)
+        ])
+        connection.execute(alias_table.insert(), [
+            {'email': f'alias-{index:03d}@example.net'}
+            for index in range(population_size)
+        ])
+
+    migration = _load_migration(
+        ADDRESS_MIGRATION,
+        'address_population_bounded_preflight',
+    )
+    lower_calls = 0
+    with engine.connect() as connection:
+        collisions, truncated = migration._cross_table_collisions(connection)
+
+    assert collisions == []
+    assert truncated is False
+    assert lower_calls <= population_size * 8
+    engine.dispose()
+
+
 def test_address_migration_rebuilds_inbound_user_fks_only_on_sqlite():
     migration = _load_migration(
         ADDRESS_MIGRATION,
