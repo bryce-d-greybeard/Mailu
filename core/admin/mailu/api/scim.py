@@ -959,6 +959,30 @@ def _get_group(group_id):
     return resource
 
 
+def _reload_committed_group(group_id):
+    resource = _get_group(group_id)
+    if resource is None:
+        raise models.ScimIdentityError(
+            f'Committed SCIM Group {group_id!r} cannot be reloaded'
+        )
+    return resource
+
+
+def _committed_group_response(group_id, status=200):
+    try:
+        resource = _reload_committed_group(group_id)
+    except (models.ScimIdentityError, SQLAlchemyError):
+        models.db.session.rollback()
+        flask.current_app.logger.exception(
+            'Committed SCIM Group reload failed'
+        )
+        return _scim_error(
+            500,
+            'The committed SCIM Group could not be reloaded',
+        )
+    return _scim_response(_make_group_resource(resource), status)
+
+
 def _member_values(data):
     members = data.get('members', [])
     if members is None:
@@ -1999,6 +2023,7 @@ def _create_group_response(data):
             member_ids=replacement['members'],
             external_destinations=replacement['externalDestinations'],
         )
+        resource_id = resource.id
         models.db.session.commit()
     except (IntegrityError, models.AddressConflict):
         models.db.session.rollback()
@@ -2019,7 +2044,7 @@ def _create_group_response(data):
         models.db.session.rollback()
         flask.current_app.logger.exception('SCIM Group creation failed')
         return _scim_error(500, 'The SCIM Group could not be created')
-    return _scim_response(_make_group_resource(resource), 201)
+    return _committed_group_response(resource_id, 201)
 
 
 def _get_group_response(group_id):
@@ -2070,6 +2095,7 @@ def _replace_group_response(
             member_ids=replacement['members'],
             external_destinations=replacement['externalDestinations'],
         )
+        resource_id = resource.id
         models.db.session.commit()
     except (
         models.ScimExternalDestinationError,
@@ -2087,7 +2113,7 @@ def _replace_group_response(
         models.db.session.rollback()
         flask.current_app.logger.exception('SCIM Group replacement failed')
         return _scim_error(500, 'The SCIM Group could not be replaced')
-    return _scim_response(_make_group_resource(resource))
+    return _committed_group_response(resource_id)
 
 
 def _patch_group_response(
@@ -2135,6 +2161,7 @@ def _patch_group_response(
             member_ids=replacement['members'],
             external_destinations=replacement['externalDestinations'],
         )
+        resource_id = resource.id
         models.db.session.commit()
     except (
         models.ScimExternalDestinationError,
@@ -2152,7 +2179,7 @@ def _patch_group_response(
         models.db.session.rollback()
         flask.current_app.logger.exception('SCIM Group patch failed')
         return _scim_error(500, 'The SCIM Group could not be patched')
-    return _scim_response(_make_group_resource(resource))
+    return _committed_group_response(resource_id)
 
 
 def _delete_group_response(

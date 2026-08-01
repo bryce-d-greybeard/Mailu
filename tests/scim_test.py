@@ -3,6 +3,7 @@ import urllib.parse
 
 import pytest
 from sqlalchemy import event
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from mailu import models
@@ -252,6 +253,179 @@ def group_payload(
             'externalDestinations': external_destinations or [],
         },
     }
+
+
+@pytest.mark.parametrize('population', [1, 8])
+@pytest.mark.parametrize(
+    ('method', 'expected_status'),
+    [('POST', 201), ('PUT', 200), ('PATCH', 200)],
+)
+def test_scim_group_mutation_post_commit_query_count_is_population_independent(
+    app,
+    client,
+    method,
+    expected_status,
+    population,
+):
+    create_domain()
+    members = [
+        create_user(f'write-query-{method.lower()}-{population}-{index}')
+        for index in range(population)
+    ]
+    member_ids = [scim_id(member) for member in members]
+    destinations = [
+        f'write-query-{method.lower()}-{population}-{index}@outside.test'
+        for index in range(population)
+    ]
+    alias_address = (
+        f'write-query-{method.lower()}-{population}@example.com'
+    )
+    resource_id = None
+    path = '/api/scim/v2/Groups'
+    request_payload = group_payload(
+        alias_address,
+        display_name='Measured Group',
+        members=member_ids,
+        external_destinations=destinations,
+    )
+    if method != 'POST':
+        group = create_group(
+            f'write-query-{method.lower()}-{population}',
+        )
+        resource_id = scim_id(group)
+        path = f'{path}/{resource_id}'
+    if method == 'PATCH':
+        request_payload = {
+            'schemas': [PATCH_SCHEMA],
+            'Operations': [{
+                'op': 'replace',
+                'value': {
+                    'displayName': 'Measured Group',
+                    'members': [
+                        {'value': member_id}
+                        for member_id in member_ids
+                    ],
+                    GROUP_EXTENSION: {
+                        'externalDestinations': destinations,
+                    },
+                },
+            }],
+        }
+
+    models.db.session.remove()
+    engine = models.db.engine
+    after_commit_statements = []
+    phase = {'after_commit': False, 'commit_count': 0}
+
+    def mark_after_commit(_session):
+        phase['commit_count'] += 1
+        phase['after_commit'] = True
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if phase['after_commit']:
+            after_commit_statements.append(statement)
+
+    event.listen(Session, 'after_commit', mark_after_commit)
+    event.listen(engine, 'before_cursor_execute', capture)
+    try:
+        response = client.open(
+            path,
+            method=method,
+            json=request_payload,
+            headers=auth_headers(app),
+        )
+    finally:
+        event.remove(engine, 'before_cursor_execute', capture)
+        event.remove(Session, 'after_commit', mark_after_commit)
+
+    assert response.status_code == expected_status
+    assert phase['commit_count'] == 1
+    assert len(after_commit_statements) == 3, '\n\n'.join(
+        after_commit_statements
+    )
+
+    payload = response.get_json()
+    resource_id = resource_id or payload['id']
+    assert sorted(member['value'] for member in payload['members']) == sorted(
+        member_ids
+    )
+    assert payload[GROUP_EXTENSION]['externalDestinations'] == sorted(
+        destinations
+    )
+    assert response.headers['ETag'] == payload['meta']['version']
+    assert response.headers['Content-Location'] == payload['meta']['location']
+    if method == 'POST':
+        assert response.headers['Location'] == payload['meta']['location']
+
+    cold = client.get(
+        f'/api/scim/v2/Groups/{resource_id}',
+        headers=auth_headers(app),
+    )
+    assert cold.status_code == 200
+    assert cold.data == response.data
+    assert cold.headers['ETag'] == response.headers['ETag']
+
+
+@pytest.mark.parametrize('reload_failure', ['missing', 'database'])
+@pytest.mark.parametrize('method', ['POST', 'PUT', 'PATCH'])
+def test_scim_group_mutation_post_commit_reload_failure_is_explicit(
+    app,
+    client,
+    monkeypatch,
+    method,
+    reload_failure,
+):
+    create_domain()
+    alias_address = f'reload-failure-{method.lower()}@example.com'
+    path = '/api/scim/v2/Groups'
+    request_payload = group_payload(
+        alias_address,
+        display_name='Committed despite reload failure',
+        external_destinations=['committed@outside.test'],
+    )
+    if method != 'POST':
+        group = create_group(f'reload-failure-{method.lower()}')
+        path = f'{path}/{scim_id(group)}'
+    if method == 'PATCH':
+        request_payload = {
+            'schemas': [PATCH_SCHEMA],
+            'Operations': [{
+                'op': 'replace',
+                'value': {
+                    'displayName': 'Committed despite reload failure',
+                    GROUP_EXTENSION: {
+                        'externalDestinations': ['committed@outside.test'],
+                    },
+                },
+            }],
+        }
+    if reload_failure == 'missing':
+        monkeypatch.setattr(scim, '_get_group', lambda _group_id: None)
+    else:
+        def fail_reload(_group_id):
+            raise SQLAlchemyError('injected committed reload failure')
+
+        monkeypatch.setattr(scim, '_get_group', fail_reload)
+
+    response = client.open(
+        path,
+        method=method,
+        json=request_payload,
+        headers=auth_headers(app),
+    )
+
+    assert response.status_code == 500
+    assert response.get_json() == {
+        'schemas': ['urn:ietf:params:scim:api:messages:2.0:Error'],
+        'status': '500',
+        'detail': 'The committed SCIM Group could not be reloaded',
+    }
+    models.db.session.remove()
+    group = models.db.session.get(models.Alias, alias_address)
+    assert group is not None
+    assert group.comment == 'Committed despite reload failure'
+    assert group.destination == ['committed@outside.test']
+    assert group.scim_resource is not None
 
 
 def assert_precondition_failed(response):
