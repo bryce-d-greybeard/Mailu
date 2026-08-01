@@ -2,6 +2,7 @@ import time
 import urllib.parse
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from mailu import models
@@ -20,6 +21,22 @@ def auth_headers(app):
         'Authorization': f'Bearer {app.config["API_TOKEN"]}',
         'Content-Type': 'application/scim+json',
     }
+
+
+def scim_get_with_statements(app, client, path):
+    models.db.session.remove()
+    engine = models.db.engine
+    statements = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(engine, 'before_cursor_execute', capture)
+    try:
+        response = client.get(path, headers=auth_headers(app))
+    finally:
+        event.remove(engine, 'before_cursor_execute', capture)
+    return response, statements
 
 
 def create_domain(name='example.com'):
@@ -86,6 +103,133 @@ def scim_group(resource_id):
     if resource is not None:
         return resource.alias
     return models.db.session.get(models.Alias, resource_id)
+
+
+@pytest.mark.parametrize('page_size', [1, 2])
+def test_scim_user_list_statement_count_is_page_size_independent(
+    app,
+    client,
+    page_size,
+):
+    create_user('query-user-one')
+    create_user('query-user-two')
+
+    response, statements = scim_get_with_statements(
+        app,
+        client,
+        f'/api/scim/v2/Users?count={page_size}',
+    )
+
+    assert response.status_code == 200
+    assert response.json['itemsPerPage'] == page_size
+    assert len(response.json['Resources']) == page_size
+    assert len(statements) == 2, '\n\n'.join(statements)
+
+
+@pytest.mark.parametrize('page_size', [1, 2])
+def test_scim_group_list_statement_count_is_page_size_independent(
+    app,
+    client,
+    page_size,
+):
+    users = [
+        create_user('query-member-one'),
+        create_user('query-member-two'),
+    ]
+    groups = [
+        create_group('query-group-one'),
+        create_group('query-group-two'),
+    ]
+    for index, (group, user) in enumerate(zip(groups, users), start=1):
+        models.replace_scim_group_graph(
+            group.scim_resource,
+            member_ids=[scim_id(user)],
+            external_destinations=[f'external-{index}@example.net'],
+        )
+    models.db.session.commit()
+
+    response, statements = scim_get_with_statements(
+        app,
+        client,
+        f'/api/scim/v2/Groups?count={page_size}',
+    )
+
+    assert response.status_code == 200
+    assert response.json['itemsPerPage'] == page_size
+    assert len(response.json['Resources']) == page_size
+    assert all(
+        len(resource['members']) == 1
+        for resource in response.json['Resources']
+    )
+    assert all(
+        len(resource[GROUP_EXTENSION]['externalDestinations']) == 1
+        for resource in response.json['Resources']
+    )
+    assert len(statements) == 4, '\n\n'.join(statements)
+
+
+@pytest.mark.parametrize(
+    ('collection', 'expected_statement_count'),
+    [('Users', 1), ('Groups', 3)],
+)
+def test_scim_single_get_statement_count(
+    app,
+    client,
+    collection,
+    expected_statement_count,
+):
+    user = create_user('query-single-member')
+    resource_id = scim_id(user)
+    if collection == 'Groups':
+        group = create_group('query-single-group')
+        models.replace_scim_group_graph(
+            group.scim_resource,
+            member_ids=[resource_id],
+            external_destinations=['single-external@example.net'],
+        )
+        models.db.session.commit()
+        resource_id = scim_id(group)
+
+    response, statements = scim_get_with_statements(
+        app,
+        client,
+        f'/api/scim/v2/{collection}/{resource_id}',
+    )
+
+    assert response.status_code == 200
+    assert response.json['id'] == resource_id
+    assert len(statements) == expected_statement_count, '\n\n'.join(statements)
+
+
+@pytest.mark.parametrize('collection', ['Users', 'Groups'])
+def test_scim_single_get_rejects_wrong_case_opaque_id(
+    app,
+    client,
+    monkeypatch,
+    collection,
+):
+    resource_id = 'abcdef01-2345-6789-abcd-ef0123456789'
+    monkeypatch.setattr(models, 'new_scim_id', lambda: resource_id)
+    subject = (
+        create_user('query-exact-user')
+        if collection == 'Users'
+        else create_group('query-exact-group')
+    )
+
+    assert scim_id(subject) == resource_id
+    assert client.get(
+        f'/api/scim/v2/{collection}/{resource_id}',
+        headers=auth_headers(app),
+    ).status_code == 200
+
+    wrong_case = client.get(
+        f'/api/scim/v2/{collection}/{resource_id.upper()}',
+        headers=auth_headers(app),
+    )
+
+    assert wrong_case.status_code == 404
+    assert wrong_case.content_type == 'application/scim+json'
+    assert wrong_case.get_json()['status'] == '404'
 
 
 def group_payload(
@@ -1126,6 +1270,7 @@ def test_scim_repeated_group_delete_returns_scim_404(app, client):
     url = f'/api/scim/v2/Groups/{group_id}'
 
     assert client.delete(url, headers=auth_headers(app)).status_code == 204
+    assert client.get(url, headers=auth_headers(app)).status_code == 404
     repeated = client.delete(url, headers=auth_headers(app))
 
     assert repeated.status_code == 404

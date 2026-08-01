@@ -8,6 +8,7 @@ import flask
 import sqlalchemy
 import validators
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import contains_eager, joinedload, selectinload
 from werkzeug.datastructures import ETags
 from werkzeug.exceptions import HTTPException
 from werkzeug.http import unquote_etag
@@ -40,6 +41,12 @@ _PROJECTION_SEGMENT_PATTERN = re.compile(
     r'^(?:[A-Za-z][A-Za-z0-9_-]*|\$ref)$'
 )
 _INVALID_PERCENT_ESCAPE = re.compile(r'%(?![0-9A-Fa-f]{2})')
+_GROUP_READ_OPTIONS = (
+    selectinload(models.ScimResource.member_edges).joinedload(
+        models.ScimGroupMember.member
+    ),
+    selectinload(models.ScimResource.destinations),
+)
 _SCIM_KEY_CASES = {
     key.lower(): key
     for key in (
@@ -850,11 +857,19 @@ def _resource_id(value, resource_type):
 
 
 def _get_user(user_id):
-    return models.ScimResource.get_exact(
-        user_id,
-        resource_type='User',
-        active_only=True,
+    resource = (
+        models.ScimResource.query
+        .filter(
+            models.ScimResource.id == user_id,
+            models.ScimResource.resource_type == 'User',
+            models.ScimResource.deleted_at.is_(None),
+        )
+        .options(joinedload(models.ScimResource.user))
+        .one_or_none()
     )
+    if resource is None or resource.id != user_id:
+        return None
+    return resource
 
 
 def _get_scim_for_update(resource_id, resource_type):
@@ -926,11 +941,22 @@ def _make_user_resource(resource):
 
 
 def _get_group(group_id):
-    return models.ScimResource.get_exact(
-        group_id,
-        resource_type='Group',
-        active_only=True,
+    resource = (
+        models.ScimResource.query
+        .filter(
+            models.ScimResource.id == group_id,
+            models.ScimResource.resource_type == 'Group',
+            models.ScimResource.deleted_at.is_(None),
+        )
+        .options(
+            joinedload(models.ScimResource.alias),
+            *_GROUP_READ_OPTIONS,
+        )
+        .one_or_none()
     )
+    if resource is None or resource.id != group_id:
+        return None
+    return resource
 
 
 def _member_values(data):
@@ -1878,6 +1904,10 @@ def _list_groups_response():
             models.Alias,
             models.ScimResource.alias_email == models.Alias._email,
         )
+        .options(
+            contains_eager(models.ScimResource.alias),
+            *_GROUP_READ_OPTIONS,
+        )
         .order_by(models.ScimResource.id)
     )
 
@@ -2227,6 +2257,7 @@ def list_users():
             models.User,
             models.ScimResource.user_email == models.User._email,
         )
+        .options(contains_eager(models.ScimResource.user))
         .order_by(models.ScimResource.id)
     )
 
