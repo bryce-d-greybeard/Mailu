@@ -1676,22 +1676,60 @@ def canonicalize_scim_destination(value):
     return destination
 
 
-def _active_scim_resource(resource_id):
-    resource = db.session.execute(
-        sqlalchemy.select(ScimResource)
-        .where(ScimResource.id == resource_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    ).scalar_one_or_none()
-    if (
-        resource is None
-        or resource.id != resource_id
-        or resource.deleted_at is not None
-    ):
-        raise ScimGraphError(
-            f'SCIM member {resource_id!r} is not an active resource'
-        )
-    return resource
+_SCIM_GRAPH_PROBE_CHUNK_SIZE = 500
+
+
+def _active_scim_resources(resource_ids):
+    active = []
+    for start in range(0, len(resource_ids), _SCIM_GRAPH_PROBE_CHUNK_SIZE):
+        chunk = resource_ids[start:start + _SCIM_GRAPH_PROBE_CHUNK_SIZE]
+        resources = {}
+        for resource in db.session.execute(
+            sqlalchemy.select(ScimResource)
+            .where(ScimResource.id.in_(chunk))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalars():
+            resources[resource.id] = resource
+        for resource_id in chunk:
+            resource = resources.get(resource_id)
+            if (
+                resource is None
+                or resource.id != resource_id
+                or resource.deleted_at is not None
+            ):
+                raise ScimGraphError(
+                    f'SCIM member {resource_id!r} is not an active resource'
+                )
+            active.append(resource)
+    return active
+
+
+def _reject_local_scim_destinations(destinations):
+    for start in range(0, len(destinations), _SCIM_GRAPH_PROBE_CHUNK_SIZE):
+        chunk = destinations[start:start + _SCIM_GRAPH_PROBE_CHUNK_SIZE]
+        possible_conflict = db.session.execute(
+            sqlalchemy.select(MailAddress.email)
+            .where(MailAddress.email.in_(chunk))
+            .limit(1)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if possible_conflict is None:
+            continue
+
+        # Routing-address equality follows the database collation.  A row
+        # returned for an IN probe is not necessarily byte-equal to the input,
+        # so retain scalar equality probes to identify the first conflict.
+        for destination in chunk:
+            local = db.session.execute(
+                sqlalchemy.select(MailAddress.email)
+                .where(MailAddress.email == destination)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if local is not None:
+                raise ScimExternalDestinationError(
+                    f'External destination {destination!r} is locally owned'
+                )
 
 
 def _validate_scim_cycle(group, member_ids):
@@ -1788,23 +1826,14 @@ def replace_scim_group_graph(
     lock_scim_graph()
 
     member_ids = list(dict.fromkeys(member_ids or ()))
-    members = [_active_scim_resource(member_id) for member_id in member_ids]
+    members = _active_scim_resources(member_ids)
     _validate_scim_cycle(group, member_ids)
 
     normalized_destinations = sorted({
         canonicalize_scim_destination(value)
         for value in (external_destinations or ())
     })
-    for destination in normalized_destinations:
-        local = db.session.execute(
-            sqlalchemy.select(MailAddress.email)
-            .where(MailAddress.email == destination)
-            .with_for_update()
-        ).scalar_one_or_none()
-        if local is not None:
-            raise ScimExternalDestinationError(
-                f'External destination {destination!r} is locally owned'
-            )
+    _reject_local_scim_destinations(normalized_destinations)
 
     db.session.execute(
         sqlalchemy.delete(ScimGroupMember).where(

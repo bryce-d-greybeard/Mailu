@@ -10,6 +10,7 @@ import pathlib
 import re
 import threading
 import unicodedata
+from contextlib import contextmanager
 
 import pytest
 import sqlalchemy as sa
@@ -69,6 +70,49 @@ def _managed_group(localpart, *, destination=None):
     models.db.session.add(resource)
     models.db.session.commit()
     return resource
+
+
+@contextmanager
+def _captured_sql():
+    statements = []
+
+    def capture(_conn, _cursor, statement, _parameters, context, _executemany):
+        bound_strings = tuple(
+            value
+            for parameter_set in context.compiled_parameters
+            for value in parameter_set.values()
+            if isinstance(value, str)
+        )
+        statements.append((
+            ' '.join(statement.lower().split()),
+            bound_strings,
+        ))
+
+    sa.event.listen(models.db.engine, 'before_cursor_execute', capture)
+    try:
+        yield statements
+    finally:
+        sa.event.remove(models.db.engine, 'before_cursor_execute', capture)
+
+
+def _group_graph_snapshot(group_id):
+    group = models.db.session.get(models.ScimResource, group_id)
+    alias = models.db.session.get(models.Alias, group.alias_email)
+    return {
+        'alias_comment': alias.comment,
+        'alias_destination': tuple(alias.destination),
+        'destinations': tuple(models.db.session.execute(
+            sa.select(models.ScimGroupDestination.destination)
+            .where(models.ScimGroupDestination.group_id == group_id)
+            .order_by(models.ScimGroupDestination.destination)
+        ).scalars()),
+        'external_id': group.external_id,
+        'members': tuple(models.db.session.execute(
+            sa.select(models.ScimGroupMember.member_id)
+            .where(models.ScimGroupMember.group_id == group_id)
+            .order_by(models.ScimGroupMember.member_id)
+        ).scalars()),
+    }
 
 
 def test_sqlite_foreign_keys_are_enabled_without_fixture_pragma(app):
@@ -375,6 +419,270 @@ def test_managed_alias_edit_permit_does_not_survive_rollback(app):
 
     alias = models.db.session.get(models.Alias, alias.email)
     alias.comment = 'ordinary edit after rollback'
+    with pytest.raises(models.ScimManagedAliasError):
+        models.db.session.commit()
+    models.db.session.rollback()
+
+
+@pytest.mark.parametrize('population', [1, 8])
+def test_graph_validation_probe_count_is_population_independent(
+    app,
+    population,
+):
+    members = [
+        _user(f'batched-member-{population}-{index}')
+        for index in range(population)
+    ]
+    member_ids = [member.scim_resource.id for member in members]
+    group = _managed_group(f'batched-group-{population}')
+    assert group.alias is not None
+    destinations = [
+        f'external-{population}-{index}@outside.test'
+        for index in range(population)
+    ]
+    with _captured_sql() as statements:
+        models.replace_scim_group_graph(
+            group,
+            member_ids=member_ids,
+            external_destinations=destinations,
+        )
+
+    member_probes = [
+        statement
+        for statement, bound_strings in statements
+        if (
+            ' from scim_resource where scim_resource.id ' in statement
+            and set(bound_strings).intersection(member_ids)
+        )
+    ]
+    local_address_probes = [
+        statement
+        for statement, bound_strings in statements
+        if (
+            ' from mail_address where mail_address.email ' in statement
+            and set(bound_strings).intersection(destinations)
+        )
+    ]
+    assert (len(member_probes), len(local_address_probes)) == (1, 1), {
+        'member_probes': member_probes,
+        'local_address_probes': local_address_probes,
+    }
+
+    models.db.session.commit()
+    assert {edge.member_id for edge in group.member_edges} == set(member_ids)
+    assert {
+        destination.destination
+        for destination in group.destinations
+    } == set(destinations)
+
+
+def test_graph_validation_probe_chunk_boundary(app):
+    domain = _domain()
+    models.db.session.add_all(
+        models.User(
+            localpart=f'chunk-member-{index:03d}',
+            domain=domain,
+            password='not-a-real-password',
+        )
+        for index in range(models._SCIM_GRAPH_PROBE_CHUNK_SIZE)
+    )
+    models.db.session.commit()
+    member_ids = list(models.db.session.execute(
+        sa.select(models.ScimResource.id)
+        .where(models.ScimResource.resource_type == 'User')
+        .order_by(models.ScimResource.id)
+    ).scalars())
+    assert len(member_ids) == models._SCIM_GRAPH_PROBE_CHUNK_SIZE
+    missing_id = 'missing-member-id'
+    requested_member_ids = [*member_ids, missing_id]
+    destinations = [
+        f'chunk-destination-{index:03d}@outside.test'
+        for index in range(models._SCIM_GRAPH_PROBE_CHUNK_SIZE + 1)
+    ]
+
+    with _captured_sql() as statements:
+        with pytest.raises(
+            models.ScimGraphError,
+            match=re.escape(
+                f'SCIM member {missing_id!r} is not an active resource'
+            ),
+        ):
+            models._active_scim_resources(requested_member_ids)
+        models._reject_local_scim_destinations(destinations)
+
+    member_id_set = set(requested_member_ids)
+    destination_set = set(destinations)
+    member_probe_sizes = [
+        len(member_id_set.intersection(bound_strings))
+        for statement, bound_strings in statements
+        if ' from scim_resource where scim_resource.id in ' in statement
+    ]
+    destination_probe_sizes = [
+        len(destination_set.intersection(bound_strings))
+        for statement, bound_strings in statements
+        if ' from mail_address where mail_address.email in ' in statement
+    ]
+    assert member_probe_sizes == [500, 1]
+    assert destination_probe_sizes == [500, 1]
+
+
+@pytest.mark.parametrize('failure', ['wrong-case', 'tombstoned'])
+def test_graph_batch_member_failure_preserves_order_and_old_graph(
+    app,
+    monkeypatch,
+    failure,
+):
+    original_member = _user(f'original-{failure}')
+    original_member_id = original_member.scim_resource.id
+    group = _managed_group(f'member-failure-{failure}')
+    models.replace_scim_group_graph(
+        group,
+        member_ids=[original_member_id],
+        external_destinations=['original@outside.test'],
+    )
+    models.db.session.commit()
+    group_id = group.id
+
+    if failure == 'wrong-case':
+        exact_id = 'abcdef01-2345-6789-abcd-ef0123456789'
+        monkeypatch.setattr(models, 'new_scim_id', lambda: exact_id)
+        _user('wrong-case-candidate')
+        bad_id = exact_id.upper()
+    else:
+        candidate = _user('tombstoned-candidate')
+        bad_id = candidate.scim_resource.id
+        models.tombstone_scim_resource(candidate.scim_resource)
+        models.db.session.commit()
+
+    before = _group_graph_snapshot(group_id)
+    group = models.db.session.get(models.ScimResource, group_id)
+    later_missing_id = 'later-missing-member-id'
+    with pytest.raises(
+        models.ScimGraphError,
+        match=re.escape(
+            f'SCIM member {bad_id!r} is not an active resource'
+        ),
+    ):
+        models.replace_scim_group_graph(
+            group,
+            member_ids=[original_member_id, bad_id, later_missing_id],
+            external_destinations=['replacement@outside.test'],
+        )
+    models.db.session.rollback()
+
+    assert _group_graph_snapshot(group_id) == before
+
+
+def test_graph_batch_local_conflict_uses_sorted_request_order_and_rolls_back(app):
+    original_member = _user('local-conflict-original')
+    group = _managed_group('local-conflict-group')
+    models.replace_scim_group_graph(
+        group,
+        member_ids=[original_member.scim_resource.id],
+        external_destinations=['original@outside.test'],
+    )
+    models.db.session.commit()
+    group_id = group.id
+    _user('z-local-conflict')
+    _user('m-local-conflict')
+    before = _group_graph_snapshot(group_id)
+    first_conflict = 'm-local-conflict@example.com'
+
+    with pytest.raises(
+        models.ScimExternalDestinationError,
+        match=re.escape(
+            f'External destination {first_conflict!r} is locally owned'
+        ),
+    ):
+        models.replace_scim_group_graph(
+            models.db.session.get(models.ScimResource, group_id),
+            member_ids=[],
+            external_destinations=[
+                'z-local-conflict@example.com',
+                'a-harmless@outside.test',
+                first_conflict,
+            ],
+        )
+    models.db.session.rollback()
+
+    assert _group_graph_snapshot(group_id) == before
+
+
+def test_mysql_batch_destination_conflict_preserves_routing_collation(app):
+    if models.db.engine.dialect.name not in {'mysql', 'mariadb'}:
+        pytest.skip('requires MySQL/MariaDB routing collation')
+
+    stored_first = _user('café-collation')
+    stored_second = _user('résumé-collation')
+    requested_first = 'cafe-collation@example.com'
+    requested_second = 'resume-collation@example.com'
+    assert models.db.session.execute(
+        sa.select(models.MailAddress.email)
+        .where(models.MailAddress.email == requested_first)
+    ).scalar_one() == stored_first.email
+    assert models.db.session.execute(
+        sa.select(models.MailAddress.email)
+        .where(models.MailAddress.email == requested_second)
+    ).scalar_one() == stored_second.email
+    group = _managed_group('collation-conflict-group')
+
+    with pytest.raises(
+        models.ScimExternalDestinationError,
+        match=re.escape(
+            f'External destination {requested_first!r} is locally owned'
+        ),
+    ):
+        models.replace_scim_group_graph(
+            group,
+            member_ids=[],
+            external_destinations=[
+                requested_second,
+                requested_first,
+                'a-harmless@outside.test',
+            ],
+        )
+    models.db.session.rollback()
+
+
+def test_graph_replace_rolls_back_after_staging_failure(app, monkeypatch):
+    original_member = _user('staging-original')
+    replacement_member = _user('staging-replacement')
+    group = _managed_group('staging-failure-group')
+    group.external_id = 'original-external-id'
+    models.permit_scim_managed_alias_edit(group.alias)
+    group.alias.comment = 'Original comment'
+    models.replace_scim_group_graph(
+        group,
+        member_ids=[original_member.scim_resource.id],
+        external_destinations=['original@outside.test'],
+    )
+    models.db.session.commit()
+    group_id = group.id
+    before = _group_graph_snapshot(group_id)
+
+    def fail_materialization(failing_group):
+        models.permit_scim_managed_alias_edit(failing_group.alias)
+        raise models.ScimGraphError('injected post-staging failure')
+
+    monkeypatch.setattr(models, 'materialize_scim_group', fail_materialization)
+    group = models.db.session.get(models.ScimResource, group_id)
+    models.permit_scim_managed_alias_edit(group.alias)
+    group.alias.comment = 'Replacement comment'
+    group.external_id = 'replacement-external-id'
+    with pytest.raises(
+        models.ScimGraphError,
+        match='injected post-staging failure',
+    ):
+        models.replace_scim_group_graph(
+            group,
+            member_ids=[replacement_member.scim_resource.id],
+            external_destinations=['replacement@outside.test'],
+        )
+    models.db.session.rollback()
+
+    assert _group_graph_snapshot(group_id) == before
+    alias = models.db.session.get(models.ScimResource, group_id).alias
+    alias.comment = 'Unpermitted edit after rollback'
     with pytest.raises(models.ScimManagedAliasError):
         models.db.session.commit()
     models.db.session.rollback()
