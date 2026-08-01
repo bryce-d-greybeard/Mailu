@@ -49,7 +49,8 @@ def _alias(domain, localpart='shared'):
 
 
 def _enable_sqlite_foreign_keys(session):
-    session.execute(sa.text('PRAGMA foreign_keys=ON'))
+    if session.get_bind().dialect.name == 'sqlite':
+        session.execute(sa.text('PRAGMA foreign_keys=ON'))
 
 
 def _bearer(app):

@@ -176,6 +176,14 @@ def user_import(localpart, domain_name, password_hash):
 def config_update(verbose=False, delete_objects=False):
     """ Sync configuration with data from YAML (deprecated)
     """
+    try:
+        _config_update(verbose=verbose, delete_objects=delete_objects)
+    except models.ScimManagedAliasError as exc:
+        db.session.rollback()
+        raise click.ClickException(str(exc)) from exc
+
+
+def _config_update(verbose=False, delete_objects=False):
     new_config = yaml.safe_load(sys.stdin)
     # print new_config
     domains = new_config.get('domains', [])
@@ -273,7 +281,7 @@ def config_update(verbose=False, delete_objects=False):
             alias.wildcard = wildcard
         db.session.add(alias)
 
-    db.session.commit()
+    db.session.flush()
 
     managers = new_config.get('managers', [])
     # tracked_managers=set()
@@ -288,7 +296,7 @@ def config_update(verbose=False, delete_objects=False):
             domain.managers.append(manageruser)
         db.session.add(domain)
 
-    db.session.commit()
+    db.session.flush()
 
     if delete_objects:
         for user in db.session.query(models.User).all():
@@ -447,8 +455,12 @@ def user_delete(email, really=False):
 def alias_delete(email):
     """delete alias"""
     if alias := models.Alias.query.get(email):
-        db.session.delete(alias)
-        db.session.commit()
+        try:
+            db.session.delete(alias)
+            db.session.commit()
+        except models.ScimManagedAliasError as exc:
+            db.session.rollback()
+            raise click.ClickException(str(exc)) from exc
 
 
 @mailu.command()
@@ -489,12 +501,12 @@ def scim_group_adopt(email, external_id=None):
     if alias is None or alias.email != email:
         raise click.ClickException(f'alias {email!r} not found')
 
-    original_destinations = list(alias.destination)
     try:
         group = models.create_scim_group_mapping(
             alias,
             external_id=external_id,
         )
+        original_destinations = list(group.alias.destination)
         member_ids = []
         external_destinations = []
         for value in original_destinations:

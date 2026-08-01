@@ -172,8 +172,13 @@ class IdnaEmail(db.TypeDecorator):
 def ExactScimId():
     """Store provider IDs with byte-exact MySQL/MariaDB comparisons."""
     return db.String(255).with_variant(
-        mysql.VARCHAR(255, collation='utf8mb4_bin'),
+        mysql.VARCHAR(
+            255,
+            charset='utf8mb4',
+            collation='utf8mb4_bin',
+        ),
         'mysql',
+        'mariadb',
     )
 
 
@@ -1189,7 +1194,10 @@ class Fetch(Base):
         nullable=False)
     user = db.relationship(User,
         backref=db.backref('fetches', cascade='all, delete-orphan'))
-    protocol = db.Column(db.Enum('imap', 'pop3'), nullable=False)
+    protocol = db.Column(
+        db.Enum('imap', 'pop3', name='enum_protocol'),
+        nullable=False,
+    )
     host = db.Column(db.String(255), nullable=False)
     port = db.Column(db.Integer, nullable=False)
     tls = db.Column(db.Boolean, nullable=False, default=False)
@@ -1406,6 +1414,13 @@ class ScimGroupMember(db.Model):
         primary_key=True,
     )
 
+    __table_args__ = (
+        db.Index(
+            'scim_group_member_member_id_idx',
+            'member_id',
+        ),
+    )
+
     group = db.relationship(
         ScimResource,
         foreign_keys=[group_id],
@@ -1596,7 +1611,7 @@ def create_scim_group_mapping(
         raise ScimGroupAdoptionError('Alias is already SCIM managed')
     validate_scim_group_adoption(alias)
     resource = ScimResource(
-        id=resource_id or alias.email,
+        id=resource_id or new_scim_id(),
         resource_type='Group',
         alias=alias,
         subject_address=alias.email,

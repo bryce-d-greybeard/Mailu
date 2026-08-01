@@ -19,9 +19,14 @@ from datetime import date
 from alembic import op
 import idna
 import sqlalchemy as sa
+from sqlalchemy.dialects import mysql
 
 
 INITIAL_AUTH_GENERATION = '0' * 32
+SCIM_BACKFILL_BATCH_SIZE = 128
+MYSQL_EXACT_ID_CHARSET = 'utf8mb4'
+MYSQL_EXACT_ID_COLLATION = 'utf8mb4_bin'
+STAGING_TABLE_NAME = '_mailu_scim_resource_stage'
 
 metadata = sa.MetaData()
 user = sa.Table(
@@ -74,7 +79,7 @@ def _destructive_downgrade_allowed():
 
 def _storage_types(connection):
     """Resolve routing-key and byte-exact provider-ID storage types."""
-    if connection.dialect.name != 'mysql':
+    if connection.dialect.name not in {'mysql', 'mariadb'}:
         return sa.String(length=255), sa.String(length=255)
 
     rows = connection.execute(
@@ -107,7 +112,7 @@ def _storage_types(connection):
             'Cannot determine the User/Alias email collation before creating '
             'SCIM identity tables.'
         )
-    binary_collation = connection.scalar(
+    exact_collation = connection.scalar(
         sa.text(
             """
             SELECT COLLATION_NAME
@@ -117,24 +122,157 @@ def _storage_types(connection):
             """
         ),
         {
-            'character_set': character_set,
-            'collation': f'{character_set}_bin',
+            'character_set': MYSQL_EXACT_ID_CHARSET,
+            'collation': MYSQL_EXACT_ID_COLLATION,
         },
     )
-    if binary_collation is None:
+    if exact_collation is None:
         raise RuntimeError(
-            'Cannot find a binary collation for exact SCIM provider IDs '
-            f'in character set {character_set!r}.'
+            'Cannot find the required utf8mb4_bin collation for exact SCIM '
+            'provider IDs.'
         )
     return (
-        sa.String(length=255, collation=collation),
-        sa.String(length=255, collation=binary_collation),
+        mysql.VARCHAR(
+            length=255,
+            charset=character_set,
+            collation=collation,
+        ),
+        mysql.VARCHAR(
+            length=255,
+            charset=MYSQL_EXACT_ID_CHARSET,
+            collation=exact_collation,
+        ),
     )
+
+
+def _staging_table(routing_email_type, exact_id_type):
+    return sa.Table(
+        STAGING_TABLE_NAME,
+        sa.MetaData(),
+        sa.Column('id', exact_id_type, primary_key=True),
+        sa.Column('resource_type', sa.String(5), nullable=False),
+        sa.Column('external_id_bytes', sa.LargeBinary(1024), nullable=True),
+        sa.Column('user_email', routing_email_type, nullable=True),
+        sa.Column('alias_email', routing_email_type, nullable=True),
+        sa.Column('subject_address', routing_email_type, nullable=False),
+        sa.Column('deleted_at', sa.DateTime, nullable=True),
+        sa.Column('created_at', sa.Date, nullable=False),
+        sa.Column('updated_at', sa.Date, nullable=True),
+        sa.Column('comment', sa.String(255), nullable=True),
+        prefixes=['TEMPORARY'],
+    )
+
+
+def _drop_staging_table(connection):
+    if connection.dialect.name in {'mysql', 'mariadb'}:
+        connection.exec_driver_sql(
+            f'DROP TEMPORARY TABLE IF EXISTS {STAGING_TABLE_NAME}'
+        )
+    else:
+        connection.exec_driver_sql(
+            f'DROP TABLE IF EXISTS {STAGING_TABLE_NAME}'
+        )
+
+
+def _prepare_user_resource(email, created_at, updated_at):
+    try:
+        resource_id = _published_email_id(email)
+    except (idna.IDNAError, UnicodeError, ValueError) as exc:
+        raise RuntimeError(
+            f'Cannot publish a SCIM ID for legacy User {email!r}: {exc}'
+        ) from exc
+    if len(resource_id) > 255:
+        raise RuntimeError(
+            f'Published SCIM ID for legacy User {email!r} exceeds '
+            '255 characters'
+        )
+    return {
+        'id': resource_id,
+        'resource_type': 'User',
+        'external_id_bytes': None,
+        'user_email': email,
+        'alias_email': None,
+        'subject_address': email,
+        'deleted_at': None,
+        'created_at': created_at or date.today(),
+        'updated_at': updated_at,
+        'comment': '',
+    }
+
+
+def _stage_user_resources(connection, routing_email_type, exact_id_type):
+    """Validate and stage legacy identities in population-independent memory."""
+    staging = _staging_table(routing_email_type, exact_id_type)
+    staging.create(connection)
+    last_email = None
+    try:
+        while True:
+            query = sa.select(
+                user.c.email,
+                user.c.created_at,
+                user.c.updated_at,
+            ).order_by(user.c.email).limit(SCIM_BACKFILL_BATCH_SIZE)
+            if last_email is not None:
+                query = query.where(user.c.email > last_email)
+            rows = connection.execute(query).all()
+            if not rows:
+                break
+
+            prepared = [
+                _prepare_user_resource(email, created_at, updated_at)
+                for email, created_at, updated_at in rows
+            ]
+            connection.execute(staging.insert(), prepared)
+
+            expected = {item['id'] for item in prepared}
+            stored = set(connection.execute(
+                sa.select(staging.c.id).where(staging.c.id.in_(expected))
+            ).scalars())
+            if stored != expected:
+                raise RuntimeError(
+                    'Exact SCIM ID storage is not a lossless round trip'
+                )
+            last_email = rows[-1][0]
+    except sa.exc.SQLAlchemyError as exc:
+        # PostgreSQL rejects cleanup SQL after a statement aborts the
+        # transaction. Alembic closes this NullPool connection on failure, so
+        # the temporary table is discarded without masking the real error.
+        raise RuntimeError(
+            'Cannot stage every legacy SCIM ID without loss or collision'
+        ) from exc
+    except Exception:
+        _drop_staging_table(connection)
+        raise
+    return staging
+
+
+def _copy_staged_user_resources(connection, staging):
+    column_names = [column.name for column in scim_resource.columns]
+    last_id = None
+    while True:
+        query = sa.select(*(
+            staging.c[name] for name in column_names
+        )).order_by(staging.c.id).limit(SCIM_BACKFILL_BATCH_SIZE)
+        if last_id is not None:
+            query = query.where(staging.c.id > last_id)
+        rows = connection.execute(query).mappings().all()
+        if not rows:
+            return
+        connection.execute(
+            scim_resource.insert(),
+            [dict(row) for row in rows],
+        )
+        last_id = rows[-1]['id']
 
 
 def upgrade():
     connection = op.get_bind()
     routing_email_type, exact_id_type = _storage_types(connection)
+    staged_users = _stage_user_resources(
+        connection,
+        routing_email_type,
+        exact_id_type,
+    )
 
     with op.batch_alter_table('user') as batch:
         batch.add_column(
@@ -243,6 +381,11 @@ def upgrade():
             name='scim_group_member_pkey',
         ),
     )
+    op.create_index(
+        'scim_group_member_member_id_idx',
+        'scim_group_member',
+        ['member_id'],
+    )
     op.create_table(
         'scim_group_destination',
         sa.Column('group_id', exact_id_type, nullable=False),
@@ -270,28 +413,7 @@ def upgrade():
         )
     )
 
-    rows = connection.execute(
-        sa.select(
-            user.c.email,
-            user.c.created_at,
-            user.c.updated_at,
-        ).order_by(user.c.email)
-    ).all()
-    for email, created_at, updated_at in rows:
-        connection.execute(
-            scim_resource.insert().values(
-                id=_published_email_id(email),
-                resource_type='User',
-                external_id_bytes=None,
-                user_email=email,
-                alias_email=None,
-                subject_address=email,
-                deleted_at=None,
-                created_at=created_at or date.today(),
-                updated_at=updated_at,
-                comment='',
-            )
-        )
+    _copy_staged_user_resources(connection, staged_users)
 
     expected_users = connection.scalar(
         sa.select(sa.func.count()).select_from(user)
@@ -325,6 +447,7 @@ def upgrade():
             nullable=False,
             server_default=None,
         )
+    _drop_staging_table(connection)
 
 
 def downgrade():

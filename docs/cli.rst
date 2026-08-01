@@ -47,6 +47,9 @@ Every local destination must already be an active SCIM User or Group; remote
 destinations are recorded in the Mailu Group extension. Adoption validates the
 whole member graph, rejects cycles, and commits the identity and normalized
 routing snapshot atomically. Ordinary alias editing is blocked after adoption.
+Adoption assigns a new opaque Group ID. If SCIM later deletes the Group, the
+old ID remains tombstoned while an operator may recreate the Alias and adopt it
+as a distinct Group with a different ID.
 
 The optional provider correlation value is case-sensitive:
 

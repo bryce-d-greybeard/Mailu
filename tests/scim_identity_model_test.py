@@ -86,6 +86,16 @@ def test_address_conflict_preserves_integrity_error_contract():
     assert issubclass(models.AddressConflict, IntegrityError)
 
 
+def test_fetch_protocol_enum_matches_migration_name():
+    assert models.Fetch.__table__.c.protocol.type.name == 'enum_protocol'
+
+
+def test_scim_group_member_reverse_index_is_declared():
+    assert 'scim_group_member_member_id_idx' in {
+        index.name for index in models.ScimGroupMember.__table__.indexes
+    }
+
+
 def test_new_orm_user_gets_random_generation_and_uuid_mapping(app):
     user = _user('new-identity')
     mapping = models.ScimResource.query.filter_by(
@@ -444,6 +454,36 @@ def test_mysql_engine_uses_read_committed(app):
     )
 
 
+def test_mysql_scim_id_columns_use_binary_collation(app):
+    if models.db.engine.dialect.name not in {'mysql', 'mariadb'}:
+        pytest.skip('requires MySQL/MariaDB')
+
+    rows = models.db.session.execute(sa.text(
+        """
+        SELECT TABLE_NAME, COLUMN_NAME, CHARACTER_SET_NAME, COLLATION_NAME
+          FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND (
+             (TABLE_NAME = 'scim_resource' AND COLUMN_NAME = 'id') OR
+             (TABLE_NAME = 'scim_group_member' AND COLUMN_NAME IN
+               ('group_id', 'member_id')) OR
+             (TABLE_NAME = 'scim_group_destination' AND COLUMN_NAME = 'group_id')
+           )
+        """
+    )).all()
+    assert len(rows) == 4
+    character_sets = {
+        character_set
+        for _table, _column, character_set, _collation in rows
+    }
+    assert character_sets == {'utf8mb4'}
+    collations = {
+        collation
+        for _table, _column, _character_set, collation in rows
+    }
+    assert collations == {'utf8mb4_bin'}
+
+
 def test_mysql_external_reservation_sees_local_commit_after_prior_read(app):
     if models.db.engine.dialect.name not in {'mysql', 'mariadb'}:
         pytest.skip('requires MySQL/MariaDB')
@@ -787,6 +827,10 @@ def test_identity_migration_backfills_users_only_and_gates_downgrade():
     assert 'auth_generation' in {
         column['name'] for column in inspector.get_columns('user')
     }
+    assert 'scim_group_member_member_id_idx' in {
+        index['name']
+        for index in inspector.get_indexes('scim_group_member')
+    }
 
     with engine.connect() as connection:
         assert connection.exec_driver_sql(
@@ -886,10 +930,11 @@ def test_address_preflight_uses_native_database_collation():
         'address_native_collation_preflight',
     )
     with engine.connect() as connection:
-        collisions = migration._cross_table_collisions(connection)
+        collisions, truncated = migration._cross_table_collisions(connection)
     assert collisions == [
         ('cafe@example.com', 'cafe@example.com', 'café@example.com')
     ]
+    assert truncated is False
     engine.dispose()
 
 

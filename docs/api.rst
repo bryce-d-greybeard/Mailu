@@ -107,7 +107,9 @@ Mailu extension ``https://mailu.io/schemas/scim/2.0/Group``:
 * ``PUT`` atomically replaces normalized members and external destinations.
   ``PATCH`` supports core member operations and the fully-qualified extension
   path. ``aliasAddress`` cannot be changed. ``DELETE`` tombstones the Group
-  ID and deletes its managed Alias.
+  ID and deletes its managed Alias. The routing address is then available for
+  an operator to recreate and explicitly adopt as a new Group; the old ID stays
+  tombstoned and never transfers to the replacement.
 * The alias domain must already exist, and normal Mailu alias limits still
   apply.
 * The materialized Alias destination list is limited to 1023 characters.

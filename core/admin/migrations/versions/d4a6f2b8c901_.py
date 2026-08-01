@@ -18,6 +18,9 @@ from alembic import op
 import sqlalchemy as sa
 
 
+COLLISION_REPORT_LIMIT = 20
+COLLISION_PROBE_LIMIT = COLLISION_REPORT_LIMIT + 1
+
 naming_convention = {
     'fk': '%(table_name)s_%(column_0_name)s_fkey',
     'pk': '%(table_name)s_pkey',
@@ -52,7 +55,7 @@ def _registry_string_types(connection):
     turns an otherwise valid populated upgrade into a non-transactional,
     half-applied migration.
     """
-    if connection.dialect.name != 'mysql':
+    if connection.dialect.name not in {'mysql', 'mariadb'}:
         return sa.String(length=255), sa.String(length=5)
 
     rows = connection.execute(
@@ -98,40 +101,39 @@ def _registry_string_types(connection):
 
 
 def _cross_table_collisions(connection):
-    users = {
-        email.lower(): email
-        for (email,) in connection.execute(sa.select(user.c.email))
-    }
-    aliases = {
-        email.lower(): email
-        for (email,) in connection.execute(sa.select(alias.c.email))
-    }
-    collisions = {
-        (users[canonical], aliases[canonical]): canonical
-        for canonical in users.keys() & aliases.keys()
-    }
-
-    # The application canonicalizer catches case/IDNA aliases.  MariaDB may
-    # use a still-broader accent-insensitive collation, so also ask the target
-    # database which values compare equal before creating any DDL.
-    native_pairs = connection.execute(
-        sa.select(user.c.email, alias.c.email).select_from(
-            user.join(alias, user.c.email == alias.c.email)
-        )
+    """Return a fixed-size diagnostic sample of cross-table collisions."""
+    collisions = {}
+    truncated = False
+    conditions = (
+        sa.func.lower(user.c.email) == sa.func.lower(alias.c.email),
+        user.c.email == alias.c.email,
     )
-    for user_email, alias_email in native_pairs:
-        collisions.setdefault(
-            (user_email, alias_email),
-            user_email.lower(),
-        )
+    for condition in conditions:
+        rows = connection.execute(
+            sa.select(user.c.email, alias.c.email)
+            .select_from(user.join(alias, condition))
+            .order_by(user.c.email, alias.c.email)
+            .limit(COLLISION_PROBE_LIMIT)
+        ).all()
+        if len(rows) > COLLISION_REPORT_LIMIT:
+            truncated = True
+        for user_email, alias_email in rows[:COLLISION_REPORT_LIMIT]:
+            collisions.setdefault(
+                (user_email, alias_email),
+                user_email.lower(),
+            )
 
-    return [
+    ordered = [
         (canonical, user_email, alias_email)
         for (user_email, alias_email), canonical in sorted(
             collisions.items(),
             key=lambda item: (item[1], item[0]),
         )
     ]
+    if len(ordered) > COLLISION_REPORT_LIMIT:
+        truncated = True
+        ordered = ordered[:COLLISION_REPORT_LIMIT]
+    return ordered, truncated
 
 
 def _requires_sqlite_reference_rebuild(connection):
@@ -243,12 +245,14 @@ def upgrade():
     registry_email_type, registry_address_type = _registry_string_types(
         connection
     )
-    collisions = _cross_table_collisions(connection)
+    collisions, collisions_truncated = _cross_table_collisions(connection)
     if collisions:
         listing = '\n'.join(
             f'  {canonical}: User={user_email}, Alias={alias_email}'
             for canonical, user_email, alias_email in collisions
         )
+        if collisions_truncated:
+            listing += '\n  ... additional collisions omitted'
         raise RuntimeError(
             'Cannot enforce global mail-address uniqueness. These addresses '
             'exist as both User and Alias:\n'
