@@ -583,7 +583,7 @@ jobs:
             -e API_TOKEN=not-empty \
             -e SECRET_KEY=test-secret \
             ghcr.io/${{ steps.string.outputs.lowercase }}/admin:${{ inputs.mailu_version }}-build \
-            sh -c "pip install --no-cache-dir pytest && python -m pytest -v -p no:cacheprovider tests/scim_identity_model_test.py tests/scim_group_adopt_test.py tests/scim_test.py -k 'mysql_ or graph_validation_probe or graph_batch or graph_replace_rolls_back_after_staging or cycle_frontier or group_mutation_post_commit or routing_committed_before_graph_lock or alias_update_losing_adoption_lock_is_rejected'"
+            sh -c "pip install --no-cache-dir pytest && python -m pytest -v -p no:cacheprovider tests/scim_identity_model_test.py tests/scim_group_adopt_test.py tests/scim_test.py -k 'mysql_ or graph_validation_probe or graph_batch or graph_replace_rolls_back_after_staging or cycle_full_scan or group_mutation_post_commit or routing_committed_before_graph_lock or alias_update_losing_adoption_lock_is_rejected'"
       - name: Run MariaDB populated migration tests with mariadbconnector
         run: |
           docker run --rm --network host \
@@ -612,7 +612,7 @@ jobs:
             -e API_TOKEN=not-empty \
             -e SECRET_KEY=test-secret \
             ghcr.io/${{ steps.string.outputs.lowercase }}/admin:${{ inputs.mailu_version }}-build \
-            sh -c "pip install --no-cache-dir pytest && python -m pytest -v -p no:cacheprovider tests/scim_identity_model_test.py tests/scim_group_adopt_test.py tests/scim_test.py -k 'mysql_ or graph_validation_probe or graph_batch or graph_replace_rolls_back_after_staging or cycle_frontier or group_mutation_post_commit or routing_committed_before_graph_lock or alias_update_losing_adoption_lock_is_rejected'"
+            sh -c "pip install --no-cache-dir pytest && python -m pytest -v -p no:cacheprovider tests/scim_identity_model_test.py tests/scim_group_adopt_test.py tests/scim_test.py -k 'mysql_ or graph_validation_probe or graph_batch or graph_replace_rolls_back_after_staging or cycle_full_scan or group_mutation_post_commit or routing_committed_before_graph_lock or alias_update_losing_adoption_lock_is_rejected'"
 
   deploy:
     name: Deploy images

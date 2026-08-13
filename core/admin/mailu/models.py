@@ -1677,8 +1677,6 @@ def canonicalize_scim_destination(value):
 
 
 _SCIM_GRAPH_PROBE_CHUNK_SIZE = 500
-# Cap indexed SQL round trips before one full-scan fallback.
-_SCIM_CYCLE_PROBE_QUERY_BUDGET = 64
 
 
 def _active_scim_resources(resource_ids):
@@ -1742,66 +1740,30 @@ def _validate_scim_cycle(group, member_ids):
     if target_id in proposed_ids:
         raise ScimGraphError('SCIM Group membership would create a cycle')
 
+    reverse_adjacency = {}
+    edges = db.session.execute(
+        sqlalchemy.select(
+            ScimGroupMember.group_id,
+            ScimGroupMember.member_id,
+        ).with_for_update()
+    ).all()
+    for group_id, member_id in edges:
+        if group_id == target_id:
+            continue
+        reverse_adjacency.setdefault(member_id, set()).add(group_id)
+
     visited = {target_id}
     frontier = [target_id]
-    probe_queries = 0
     while frontier:
-        next_frontier = []
-        for start in range(
-            0,
-            len(frontier),
-            _SCIM_GRAPH_PROBE_CHUNK_SIZE,
-        ):
-            if probe_queries == _SCIM_CYCLE_PROBE_QUERY_BUDGET:
-                reverse_adjacency = {}
-                edges = db.session.execute(
-                    sqlalchemy.select(
-                        ScimGroupMember.group_id,
-                        ScimGroupMember.member_id,
-                    ).with_for_update()
-                ).all()
-                for group_id, member_id in edges:
-                    if group_id == target_id:
-                        continue
-                    reverse_adjacency.setdefault(member_id, set()).add(
-                        group_id
-                    )
-
-                fallback_visited = {target_id}
-                fallback_frontier = [target_id]
-                while fallback_frontier:
-                    member_id = fallback_frontier.pop()
-                    for group_id in reverse_adjacency.get(member_id, ()):
-                        if group_id in proposed_ids:
-                            raise ScimGraphError(
-                                'SCIM Group membership would create a cycle'
-                            )
-                        if group_id not in fallback_visited:
-                            fallback_visited.add(group_id)
-                            fallback_frontier.append(group_id)
-                return
-
-            chunk = frontier[
-                start:start + _SCIM_GRAPH_PROBE_CHUNK_SIZE
-            ]
-            group_ids = db.session.execute(
-                sqlalchemy.select(ScimGroupMember.group_id)
-                .where(
-                    ScimGroupMember.member_id.in_(chunk),
-                    ScimGroupMember.group_id != target_id,
+        member_id = frontier.pop()
+        for group_id in reverse_adjacency.get(member_id, ()):
+            if group_id in proposed_ids:
+                raise ScimGraphError(
+                    'SCIM Group membership would create a cycle'
                 )
-                .with_for_update()
-            ).scalars()
-            probe_queries += 1
-            for group_id in group_ids:
-                if group_id in proposed_ids:
-                    raise ScimGraphError(
-                        'SCIM Group membership would create a cycle'
-                    )
-                if group_id not in visited:
-                    visited.add(group_id)
-                    next_frontier.append(group_id)
-        frontier = next_frontier
+            if group_id not in visited:
+                visited.add(group_id)
+                frontier.append(group_id)
 
 
 def permit_scim_managed_alias_edit(alias):

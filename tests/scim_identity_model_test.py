@@ -1065,7 +1065,7 @@ def test_mysql_local_claim_sees_external_delete_after_prior_read(app):
     ).count() == 0
 
 
-def test_cycle_frontier_preserves_cycle_semantics_and_exact_ids(app):
+def test_cycle_full_scan_preserves_cycle_semantics_and_exact_ids(app):
     edges = [
         ('two:parent', 'two:target'),
         ('diamond:left', 'diamond:target'),
@@ -1136,7 +1136,7 @@ def test_cycle_frontier_preserves_cycle_semantics_and_exact_ids(app):
     )
 
 
-def test_cycle_frontier_shallow_sql_ignores_unrelated_edges(app):
+def test_cycle_full_scan_reads_one_complete_locked_snapshot(app):
     unrelated_ids = [
         f'unrelated:{index:04d}'
         for index in range(1025)
@@ -1158,19 +1158,12 @@ def test_cycle_frontier_shallow_sql_ignores_unrelated_edges(app):
         )
 
     cycle_statements = _cycle_statements(statements)
-    assert len(cycle_statements) == 3
-    assert all(
-        ' where scim_group_member.member_id in ' in statement
-        and 'scim_group_member.group_id !=' in statement
-        for statement, _bound_strings in cycle_statements
-    )
-    assert all(
-        set(bound_strings).isdisjoint(unrelated_ids)
-        for _statement, bound_strings in cycle_statements
-    )
+    assert len(cycle_statements) == 1
+    assert ' where ' not in cycle_statements[0][0]
+    assert cycle_statements[0][1] == ()
 
 
-def test_cycle_frontier_chunks_wide_fan_in_at_500_values(app):
+def test_cycle_full_scan_handles_wide_fan_in_in_one_query(app):
     parent_ids = [
         f'wide:parent:{index:04d}'
         for index in range(1201)
@@ -1180,35 +1173,34 @@ def test_cycle_frontier_chunks_wide_fan_in_at_500_values(app):
         extra_ids={'wide:outside'},
     )
 
-    with _captured_sql() as statements:
+    with _captured_sql() as safe_statements:
         models._validate_scim_cycle(
             SimpleNamespace(id='wide:target'),
             ['wide:outside'],
         )
 
-    cycle_statements = _cycle_statements(statements)
-    assert len(cycle_statements) == 4
-    assert all(
-        ' where scim_group_member.member_id in ' in statement
-        and 'scim_group_member.group_id !=' in statement
-        for statement, _bound_strings in cycle_statements
-    )
-    parent_id_set = set(parent_ids)
-    chunk_sizes = [
-        len(parent_id_set.intersection(bound_strings))
-        for _statement, bound_strings in cycle_statements[1:]
-    ]
-    assert chunk_sizes == [500, 500, 201]
-    assert all(
-        size <= models._SCIM_GRAPH_PROBE_CHUNK_SIZE
-        for size in chunk_sizes
-    )
+    with _captured_sql() as cycle_statements:
+        with pytest.raises(
+            models.ScimGraphError,
+            match=re.escape('SCIM Group membership would create a cycle'),
+        ):
+            models._validate_scim_cycle(
+                SimpleNamespace(id='wide:target'),
+                [parent_ids[-1]],
+            )
+
+    for statements in (safe_statements, cycle_statements):
+        cycle_queries = _cycle_statements(statements)
+        assert len(cycle_queries) == 1
+        assert ' where ' not in cycle_queries[0][0]
+        assert cycle_queries[0][1] == ()
 
 
-def test_cycle_frontier_fallback_is_iterative_correct_and_capped(app):
+@pytest.mark.parametrize('depth', [999, 1000, 1001, 2500, 10000])
+def test_cycle_full_scan_is_iterative_at_depth_boundaries(app, depth):
     parent_ids = [
-        f'deep:parent:{index:04d}'
-        for index in range(1105)
+        f'deep:parent:{index:05d}'
+        for index in range(depth)
     ]
     edges = [
         (parent_ids[0], 'deep:target'),
@@ -1237,24 +1229,12 @@ def test_cycle_frontier_fallback_is_iterative_correct_and_capped(app):
 
     for statements in (cyclic_statements, acyclic_statements):
         cycle_statements = _cycle_statements(statements)
-        probes = [
-            entry
-            for entry in cycle_statements
-            if ' where scim_group_member.member_id in ' in entry[0]
-            and 'scim_group_member.group_id !=' in entry[0]
-        ]
-        fallback = [
-            entry
-            for entry in cycle_statements
-            if ' where ' not in entry[0]
-        ]
-        assert len(probes) == 64
-        assert len(fallback) == 1
-        assert len(cycle_statements) == 65
-        assert cycle_statements[-1] == fallback[0]
+        assert len(cycle_statements) == 1
+        assert ' where ' not in cycle_statements[0][0]
+        assert cycle_statements[0][1] == ()
 
 
-def test_cycle_frontier_rejection_preserves_old_graph_and_projection(app):
+def test_cycle_full_scan_rejection_preserves_old_graph_and_projection(app):
     original_member = _user('cycle-original')
     first = _managed_group('cycle-a')
     second = _managed_group('cycle-b')
