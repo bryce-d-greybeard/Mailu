@@ -62,6 +62,37 @@ def test_other_database_engines_keep_existing_options(
     assert app.config['SQLALCHEMY_ENGINE_OPTIONS'] == {
         'pool_pre_ping': True,
     }
+    assert app.config['SQLALCHEMY_DATABASE_URI'] == database_uri
+
+
+def test_generated_sqlite_database_uri_waits_for_concurrent_writer(
+    env_setup,
+    monkeypatch,
+):
+    monkeypatch.setenv('DB_FLAVOR', 'sqlite')
+    monkeypatch.setenv('SQLITE_DATABASE_FILE', 'data/main.db')
+    app = flask.Flask(__name__)
+
+    configuration.ConfigManager().init_app(app)
+
+    assert app.config['SQLALCHEMY_DATABASE_URI'] == (
+        'sqlite:////data/main.db?timeout=30'
+    )
+
+
+def test_default_sqlite_database_uri_waits_for_concurrent_writer(
+    env_setup,
+    monkeypatch,
+):
+    monkeypatch.setenv('DB_FLAVOR', '')
+    monkeypatch.delenv('SQLALCHEMY_DATABASE_URI')
+    app = flask.Flask(__name__)
+
+    configuration.ConfigManager().init_app(app)
+
+    assert app.config['SQLALCHEMY_DATABASE_URI'] == (
+        'sqlite:////data/main.db?timeout=30'
+    )
 
 
 def test_generated_mysql_database_uri_uses_read_committed(

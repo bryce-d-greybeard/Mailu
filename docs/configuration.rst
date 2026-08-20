@@ -341,7 +341,7 @@ Alternatives hosted options like PostgreSQL and MariaDB/MySQL can be configured 
 but the development team recommends against it. Indeed, there is currently very little data
 to be stored and SQLite is deemed both sufficient, simpler and more reliable overall.
 
-- ``SQLALCHEMY_DATABASE_URI`` (default: ``sqlite:////data/main.db``): the SQLAlchemy database URL for accessing the database
+- ``SQLALCHEMY_DATABASE_URI`` (default: ``sqlite:////data/main.db?timeout=30``): the SQLAlchemy database URL for accessing the database. The default SQLite URL waits up to 30 seconds for a concurrent writer; explicitly configured URLs retain their own driver timeout.
 - ``SQLALCHEMY_DATABASE_URI_ROUNDCUBE`` (default: ``sqlite:////data/roundcube.db``): the Roundcube database URL for accessing the Roundcube database
 
 For PostgreSQL use driver postgresql (``SQLALCHEMY_DATABASE_URI=postgresql://mailu:mailu_secret_password@database/mailu``).

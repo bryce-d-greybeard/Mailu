@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
     'DB_NAME': 'mailu',
     'DB_APPENDIX': '',
     'SQLITE_DATABASE_FILE': 'data/main.db',
-    'SQLALCHEMY_DATABASE_URI': 'sqlite:////data/main.db',
+    'SQLALCHEMY_DATABASE_URI': 'sqlite:////data/main.db?timeout=30',
     'SQLALCHEMY_DATABASE_URI_ROUNDCUBE': 'sqlite:////data/roundcube.db',
     'SQLALCHEMY_TRACK_MODIFICATIONS': False,
     # Statistics management
@@ -105,7 +105,7 @@ class ConfigManager:
     """
 
     DB_TEMPLATES = {
-        'sqlite': 'sqlite:////{SQLITE_DATABASE_FILE}',
+        'sqlite': 'sqlite:////{SQLITE_DATABASE_FILE}?timeout=30',
         'postgresql': 'postgresql://{DB_USER}:{DB_PW}@{DB_HOST}/{DB_NAME}{DB_APPENDIX}',
         'mysql': 'mysql+mysqlconnector://{DB_USER}:{DB_PW}@{DB_HOST}/{DB_NAME}{DB_APPENDIX}',
     }
